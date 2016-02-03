@@ -11,6 +11,11 @@ SCRIPT_VERSION="1.0"
 # Include appropriate paths
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
+# Current date
+DATE_BEGIN=$(date +%Y-%m-%d)
+# Current time
+TIME_BEGIN=$(date +%H:%m)
+
 # Default filename log
 LOG_FILENAME="./log/$SCRIPT_NAME.log"
 # Is destination valid?
@@ -202,53 +207,32 @@ function GetInformationsAboutDisks {
 # Freezing!!! Saving your life.
 function PerformCopy {
     local disk_source
-    local date_begin
-    local auxiliary_directory
     local checksum_file
+    local directory
 
-    date_begin=$(date +%Y-%m-%d)
-    auxiliary_directory="$DESTINATION/$date_begin-$SCRIPT_NAME-$GUEST"
-
-    mkdir -p $auxiliary_directory
-
-    checksum_file="$auxiliary_directory/CHECKSUM"
+    directory=$1
+    checksum_file="$directory/SHA512SUMS"
     touch $checksum_file
 
-    for disk_source in $@ ; do
+    for disk_source in ${DISK_SOURCE[@]} ; do
         sha512sum $disk_source >> ${checksum_file} &
-        cp --archive --force $disk_source $auxiliary_directory
-        sha512sum "$auxiliary_directory/$(basename $disk_source)" >> ${checksum_file}
+        cp --archive --force $disk_source $directory
+        sha512sum "$directory/$(basename $disk_source)" >> ${checksum_file}
     done
-
-    if [ $COMPRESS = true ]; then
-        cd $auxiliary_directory
-        tar --create --xz --file "../$(date +%Y-%m-%d)_$GUEST.tar.xz" ./ &> /dev/null
-        cd $DESTINATION
-        rm -rf $auxiliary_directory
-    fi
 
 }
 
-# Magic is performed here!!!
-function TakeSnapshot {
+function Snapshotting {
+    local directory=$1
 
-    GetInformationsAboutDisks
-
-    if [ $(GuestIsOn $GUEST) = false ]; then
-        PerformCopy ${DISK_SOURCE[@]}
-        exit 0
-    fi
-
-    virsh snapshot-create-as --domain $GUEST  "$SCRIPT_NAME-$GUEST" --disk-only --atomic --quiesce --description "This snapshot was created by $SCRIPT_NAME on $(date +%c)." &> /dev/null
+    virsh snapshot-create-as --domain $GUEST  "$SCRIPT_NAME-$GUEST" --disk-only --atomic --quiesce --description "This snapshot was created by $SCRIPT_NAME on $DATE_BEGIN." &> /dev/null
 
     if [ $? -ne 0 ]; then
-        virsh snapshot-delete $GUEST "$SCRIPT_NAME-$GUEST" --metadata
-
         echo "[ERROR] Problem to create a snapshot."
         exit 1
     fi
 
-    PerformCopy ${DISK_SOURCE[@]}
+    PerformCopy $auxiliary_directory
 
     local i=0
     while [ $i -lt ${#DISK_SOURCE[@]} ]; do
@@ -260,6 +244,38 @@ function TakeSnapshot {
     done
 
     virsh snapshot-delete $GUEST "$SCRIPT_NAME-$GUEST" --metadata &> /dev/null
+
+}
+
+# Magic is performed here!!!
+function TakeSnapshot {
+    local auxiliary_directory
+
+    GetInformationsAboutDisks
+
+    auxiliary_directory="$DESTINATION/$DATE_BEGIN.$TIME_BEGIN-$SCRIPT_NAME-$GUEST"
+
+    mkdir -p $auxiliary_directory
+
+    if [ $? -ne 0 ]; then
+        echo "[ERROR] Could not possible create a directory."
+        exit 1
+    fi
+
+    virsh dumpxml $GUEST > "$auxiliary_directory/$GUEST.xml"
+
+    if [ $(GuestIsOn $GUEST) = false ]; then
+        PerformCopy $auxiliary_directory
+    else
+        Snapshotting $auxiliary_directory
+    fi
+
+    if [ $COMPRESS = true ]; then
+        cd $auxiliary_directory
+        tar --create --xz --file "../$DATE_BEGIN.$TIME_BEGIN-$SCRIPT_NAME-$GUEST.tar.xz" * &> /dev/null
+        cd $DESTINATION
+        find $auxiliary_directory -type f -exec shred {} \;
+    fi
 
 }
 
@@ -360,6 +376,12 @@ function Interface {
                    [ $(isWriteable $arg) = true  ]; then
                     DESTINATION=$arg
                     required_args[1]=true
+
+                    # Remove last '/' if it exists.
+                    if [ $(echo $DESTINATION | grep --count "/$") -eq 1 ]; then
+                        DESTINATION="${DESTINATION::-1}"
+                    fi
+
                 else
                     echo "[ERROR] Invalid destination submitted."
                     exit 1
