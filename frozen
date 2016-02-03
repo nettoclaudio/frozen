@@ -1,0 +1,421 @@
+#!/bin/bash
+
+# Created by: Claudio Netto <nettinhorama@gmail.com>
+
+## Metadata about this program
+SCRIPT_NAME="frozen"
+SCRIPT_VERSION="1.0"
+
+## Global variables
+
+# Include appropriate paths
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Default filename log
+LOG_FILENAME="./log/$SCRIPT_NAME.log"
+# Is destination valid?
+DESTINATION=false
+# Is compression enabled?
+COMPRESS=false
+# Is verbose enabled?
+VERBOSE=false
+
+## Information about guest's disks.
+# Targets of disks: vda, sda, etc...
+DISK_TARGET=()
+# Array with full filename of disk
+DISK_SOURCE=()
+# Array with formats of disks: qcow2 or raw.
+DISK_FORMAT=()
+
+# It checks if is a directory.
+# It returns *true* iff the parameter is a directory, otherwise it returns *false*.
+function isDirectory {
+    local isDirectory=false
+
+    if [ $# -lt 1 ]; then
+        echo "[ERROR] isDirectory routine requires one argument at least."
+        exit 1
+    fi
+
+    if [ -d $1 ]; then
+        isDirectory=true
+    fi
+
+    echo $isDirectory
+}
+
+# It checks if is a file.
+# It returns *true* iff the parameter is a file, otherwise it returns *false*.
+function isFile {
+    local isFile=false
+
+    if [ $# -lt 1 ]; then
+        echo "[ERROR] isFile routine requires one argument at least."
+        exit 1
+    fi
+
+    if [ -f $1 ]; then
+        isFile=true
+    fi
+
+    echo $isFile
+}
+
+# It checks if your user has permission to read in directory/file.
+# It returns *true* iff you have permission, otherwise it returns *false*.
+function isReadable {
+    local isReadable=true
+
+    if [ $# -lt 1 ]; then
+        echo "[ERROR] isReadable routine requires one argument at least."
+        exit 1
+    fi
+
+    if [ -r $1 ]; then
+        isReadable=true
+    fi
+
+    echo $isReadable
+}
+
+# It checks if your user has permission to write in directory/file.
+# It returns *true* iff you have permission, otherwise it returns *false*.
+function isWriteable {
+    local isWriteable=false
+
+    if [ $# -lt 1 ]; then
+        echo "[ERROR] isWriteable routine requires one argument at least."
+        exit 1
+    fi
+
+    if [ -w $1 ]; then
+        isWriteable=true
+    fi
+
+    echo $isWriteable
+}
+
+# Print a message on a file or STDOUT.
+# It waits the filename/default output and a message, respectively.
+function Log {
+    local filename=$1
+    local message=$2
+
+    if [ $# -ne 2 ]; then
+        echo "[ERROR] Log routine requires two arguments."
+        exit 1
+    fi
+
+    if [ $(isDirectory "$(dirname $filename)") = false ]; then
+        mkdir --parents "$(dirname $filename)"
+    fi
+
+    if [ $(isFile "$filename") = false ]; then
+        touch $filename
+    fi
+
+    logger --skip-empty --stderr --tag $SCRIPT_NAME $message 2>> ${filename}
+}
+
+# Checks whether a submitted domain exists.
+function GuestExists {
+    local guest_exists=false
+    local guest_name=$1
+
+    if [ $# -eq 0 ]; then
+        echo "[ERROR] Checks routine requires one argument at least."
+        exit 1
+    fi
+
+    if [ $(virsh list --name --all | grep --count --max-count=1 "^$guest_name$") = "1" ]; then
+        guest_exists=true
+    fi
+
+    echo $guest_exists
+}
+
+# Detect if the guest is online.
+function GuestIsOn {
+    local status=false
+    local guest_name
+
+    if [ $# -ne 1 ]; then
+        echo "[ERROR] GuestIsOn only requires one argument."
+        exit 1
+    fi
+
+    guest_name=$1
+
+    if [ $(GuestExists $guest_name) = false ]; then
+        echo "[ERROR] GuestIsOn requires a existent guest."
+        exit 1
+    fi
+
+    if [ $(virsh dominfo $guest_name | grep "^State:" | awk "{print \$2}") = "running" ]; then
+        status=true
+    fi
+
+    echo $status
+
+}
+
+# Get information about GUEST's disks
+function GetInformationsAboutDisks {
+
+    local info
+    local info_column=0
+    local number_disk=0
+    local format_disk
+
+    for info in $(virsh domblklist $GUEST --details | grep " disk "); do
+
+        case $info_column in
+            2)
+                DISK_TARGET[$number_disk]=$info;;
+
+            3)
+                DISK_SOURCE[$number_disk]=$info
+                number_disk=$((number_disk+1));;
+        esac
+
+        info_column=$(((info_column+1)%4))
+    done
+
+    number_disk=0
+    for source in ${DISK_SOURCE}; do
+
+        format_disk=$(qemu-img info "${DISK_SOURCE[$number_disk]}" | grep "file format" | cut -d ":" -f 2 | tr --delete ' ')
+
+        if [ $format_disk = "qcow2" ] || [ $format_disk = "raw" ]; then
+            DISK_FORMAT[$number_disk]=$format_disk
+        else
+            echo "[ERROR] File format disk unsupported."
+            exit 1
+        fi
+
+        number_disk=$((number_disk+1))
+    done
+
+}
+
+# Freezing!!! Saving your life.
+function PerformCopy {
+    local disk_source
+    local date_begin
+    local auxiliary_directory
+    local checksum_file
+
+    date_begin=$(date +%Y-%m-%d)
+    auxiliary_directory="$DESTINATION/$date_begin-$SCRIPT_NAME-$GUEST"
+
+    mkdir -p $auxiliary_directory
+
+    checksum_file="$auxiliary_directory/CHECKSUM"
+    touch $checksum_file
+
+    for disk_source in $@ ; do
+        sha512sum $disk_source >> ${checksum_file} &
+        cp --archive --force $disk_source $auxiliary_directory
+        sha512sum "$auxiliary_directory/$(basename $disk_source)" >> ${checksum_file}
+    done
+
+    if [ $COMPRESS = true ]; then
+        cd $auxiliary_directory
+        tar --create --xz --file "../$(date +%Y-%m-%d)_$GUEST.tar.xz" ./ &> /dev/null
+        cd $DESTINATION
+        rm -rf $auxiliary_directory
+    fi
+
+}
+
+# Magic is performed here!!!
+function TakeSnapshot {
+
+    GetInformationsAboutDisks
+
+    if [ $(GuestIsOn $GUEST) = false ]; then
+        PerformCopy ${DISK_SOURCE[@]}
+        exit 0
+    fi
+
+    virsh snapshot-create-as --domain $GUEST  "$SCRIPT_NAME-$GUEST" --disk-only --atomic --quiesce --description "This snapshot was created by $SCRIPT_NAME on $(date +%c)." &> /dev/null
+
+    if [ $? -ne 0 ]; then
+        virsh snapshot-delete $GUEST "$SCRIPT_NAME-$GUEST" --metadata
+
+        echo "[ERROR] Problem to create a snapshot."
+        exit 1
+    fi
+
+    PerformCopy ${DISK_SOURCE[@]}
+
+    local i=0
+    while [ $i -lt ${#DISK_SOURCE[@]} ]; do
+        virsh blockcommit $GUEST ${DISK_TARGET[$i]} --active --pivot &> /dev/null
+
+        local file_extension=".$(basename ${DISK_SOURCE[$i]} | rev | cut -d '.' -f 1 | rev)"
+        shred --remove --zero "$(dirname ${DISK_SOURCE[$i]})/$(basename ${DISK_SOURCE[$i]} $file_extension).$SCRIPT_NAME-$GUEST"
+        i=$((i+1))
+    done
+
+    virsh snapshot-delete $GUEST "$SCRIPT_NAME-$GUEST" --metadata &> /dev/null
+
+}
+
+# Interact with user
+function Interface {
+    local arg
+    local required_args=(false false)
+
+    if [ $# -eq 0 ]; then
+        echo "[ERROR] Interface routine requires any arguments."
+        exit 1
+    fi
+
+    while [ $# -gt 0 ]; do
+
+        arg=$1
+        shift
+
+        case "$arg" in
+            # Informations about this program
+            -h|--help)
+                echo "Usage: % $SCRIPT_NAME --guest <GUEST_NAME> [OPTIONS]... DESTINATION"
+                echo ""
+                echo "Simple way to freeze disks of a Virtual Machine on UNIX systems."
+                echo ""
+                echo "Mandatory arguments to long options are mandatory for short options too."
+
+                echo -n -e "\t-c, --compress\t\t"
+                    echo "Enable the compression by XZ."
+
+                echo -n -e "\t-o, --output\t\t"
+                    echo "Redirect message to file."
+
+                echo -n -e "\t-v, --verbose\t\t"
+                    echo "Enable more messages to output."
+
+                exit 0;;
+            -V|--version)
+                echo "$SCRIPT_NAME $SCRIPT_VERSION"
+                exit 0;;
+
+            # Required argument
+            -g|--guest)
+                arg=$1
+                shift
+
+                if [ $(GuestExists $arg) = true ]; then
+                    GUEST=$arg
+                    required_args[0]=true
+                else
+                    echo "[ERROR] Could not finding the guest."
+                    exit 1
+                fi
+
+                continue;;
+
+            # Optional arguments
+            -c|--compress)
+                COMPRESS=true
+                continue;;
+
+            -o|--output)
+                arg=$1
+                shift
+
+                if [ $(isFile $arg) = false ]; then
+
+                    touch $arg 2> /dev/null
+
+                    if [ $? -ne 0 ]; then
+                        echo "[ERROR] Could not creating file."
+                        exit 1
+                    fi
+                fi
+
+                if [ $(isReadable $arg)  = true ] &&
+                   [ $(isWriteable $arg) = true ]; then
+                    LOG_FILENAME=$arg
+                else
+                    echo "[ERROR] Is not possible read/write in file \"$arg\". Check permissions."
+                    exit 1
+                fi
+
+                continue;;
+
+            -v|--verbose)
+                VERBOSE=true
+                continue;;
+
+            # Invalid argument
+            -*|--*)
+                echo "[ERROR] Invalid argument. See \"--help\" option to get any answers."
+                exit 1;;
+            *)
+                if [ $(isFile $arg)      = false ] &&
+                   [ $(isDirectory $arg) = true  ] &&
+                   [ $(isReadable $arg)  = true  ] &&
+                   [ $(isWriteable $arg) = true  ]; then
+                    DESTINATION=$arg
+                    required_args[1]=true
+                else
+                    echo "[ERROR] Invalid destination submitted."
+                    exit 1
+                fi
+
+                continue;;
+        esac
+
+    done
+
+    local i=0
+    while [ $i -lt ${#required_args[$i]} ]; do
+        if [ ${required_args[$i]} = false ]; then
+            echo "[ERROR] Any arguments are required. See \"--help\" option to get any answers."
+            exit 1
+        fi
+
+        i=$(($i+1))
+    done
+
+}
+
+# Verify if commands are installed
+function CheckPrerequisites {
+
+    virsh --version &> /dev/null
+
+    if [ $? -ne 0 ]; then
+        echo "[ERROR] \"virsh\" is required to use this script."
+        exit 1
+    fi
+
+    qemu-img --version &> /dev/null
+
+    if [ $? -ne 0 ]; then
+        echo "[ERROR] \"qemu-img\" is required to use this script."
+        exit 1
+    fi
+
+}
+
+function Main {
+
+    # Checks all prerequisites
+    CheckPrerequisites
+
+    # Call the routine to receive arguments
+    Interface $@
+
+    # Call the routine to take snapshot the domain
+    TakeSnapshot
+
+    # Program sucessfully completed
+    return 0
+
+}
+
+# Initializing the program and set the arguments
+Main $@
